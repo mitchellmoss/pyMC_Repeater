@@ -18,6 +18,8 @@ from pymc_core.node.handlers.protocol_request import (
     SERVER_RESPONSE_DELAY_MS
 )
 
+from pymc_core.protocol.constants import PUB_KEY_SIZE
+
 logger = logging.getLogger("ProtocolRequestHelper")
 
 
@@ -52,6 +54,7 @@ class ProtocolRequestHelper:
         # Build request handlers dict
         request_handlers = {
             REQ_TYPE_GET_STATUS: self._handle_get_status,
+            REQ_TYPE_GET_NEIGHBOURS: self._handle_get_neighbours,
         }
         
         # Create core handler
@@ -195,3 +198,109 @@ class ProtocolRequestHelper:
         logger.debug(f"GET_STATUS: noise={noise_floor}dBm, rssi={last_rssi}dBm, snr={last_snr/4}dB")
         
         return stats
+
+    def _handle_get_neighbours(self, client, timestamp: int, req_data: bytes):
+        if not req_data:
+            logger.info('REQ_TYPE_GET_NEIGHBOURS missing request data')
+            return None
+
+        request_version = req_data[0]
+        if request_version != 0:
+            logger.info(f'REQ_TYPE_GET_NEIGHBOURS unsupported version {request_version}')
+            return None
+
+        if len(req_data) < 6:
+            logger.info('REQ_TYPE_GET_NEIGHBOURS request too short')
+            return None
+
+        count = req_data[1]
+        offset = struct.unpack_from('<H', req_data, 2)[0]
+        order_by = req_data[4]
+        pubkey_prefix_length = req_data[5]
+
+        if pubkey_prefix_length > PUB_KEY_SIZE:
+            logger.debug(
+                'REQ_TYPE_GET_NEIGHBOURS invalid pubkey_prefix_length=%d clamping to %d',
+                pubkey_prefix_length,
+                PUB_KEY_SIZE,
+            )
+            pubkey_prefix_length = PUB_KEY_SIZE
+
+        storage = None
+        if self.neighbor_tracker and getattr(self.neighbor_tracker, 'storage', None):
+            storage = self.neighbor_tracker.storage
+        elif self.engine and getattr(self.engine, 'storage', None):
+            storage = self.engine.storage
+
+        neighbors = storage.get_neighbors() if storage else {}
+        if not neighbors:
+            return struct.pack('<HH', 0, 0)
+
+        entries = []
+        for pubkey, info in neighbors.items():
+            if not info:
+                continue
+            if not info.get('is_repeater', False):
+                continue
+            if not info.get('zero_hop', False):
+                continue
+            try:
+                pubkey_bytes = bytes.fromhex(pubkey) if isinstance(pubkey, str) else bytes(pubkey)
+            except Exception:
+                continue
+
+            last_seen = info.get('last_seen') or 0
+            snr = info.get('snr') or 0
+            entries.append({
+                'pubkey': pubkey_bytes,
+                'last_seen': last_seen,
+                'snr': snr,
+            })
+
+        neighbours_count = len(entries)
+        if neighbours_count == 0:
+            return struct.pack('<HH', 0, 0)
+
+        if order_by == 0:
+            entries.sort(key=lambda e: e['last_seen'], reverse=True)
+        elif order_by == 1:
+            entries.sort(key=lambda e: e['last_seen'])
+        elif order_by == 2:
+            entries.sort(key=lambda e: e['snr'], reverse=True)
+        elif order_by == 3:
+            entries.sort(key=lambda e: e['snr'])
+
+        max_results_bytes = 130
+        results_buffer = bytearray()
+        results_count = 0
+        now = int(time.time())
+
+        if count == 0 or offset >= neighbours_count:
+            return struct.pack('<HH', neighbours_count, 0)
+
+        for entry in entries[offset : offset + count]:
+            entry_size = pubkey_prefix_length + 4 + 1
+            if len(results_buffer) + entry_size > max_results_bytes:
+                break
+
+            results_buffer.extend(entry['pubkey'][:pubkey_prefix_length])
+
+            try:
+                heard_seconds_ago = max(0, int(now - float(entry['last_seen'])))
+            except Exception:
+                heard_seconds_ago = 0
+            results_buffer.extend(struct.pack('<I', heard_seconds_ago))
+
+            try:
+                snr_val = float(entry['snr'])
+            except Exception:
+                snr_val = 0.0
+            snr_scaled = int(snr_val * 4)
+            if snr_scaled < -128:
+                snr_scaled = -128
+            elif snr_scaled > 127:
+                snr_scaled = 127
+            results_buffer.extend(struct.pack('b', snr_scaled))
+            results_count += 1
+
+        return struct.pack('<HH', neighbours_count, results_count) + results_buffer
