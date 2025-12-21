@@ -20,6 +20,10 @@ from pymc_core.node.handlers.protocol_request import (
 
 logger = logging.getLogger("ProtocolRequestHelper")
 
+TELEM_CHANNEL_SELF = 1
+LPP_PERCENTAGE = 120
+UPS_BATCAP_CACHE = "/var/lib/ups-lowpower/last_batcap"
+
 
 class ProtocolRequestHelper:
     """Provides repeater-specific protocol request handlers."""
@@ -52,6 +56,7 @@ class ProtocolRequestHelper:
         # Build request handlers dict
         request_handlers = {
             REQ_TYPE_GET_STATUS: self._handle_get_status,
+            REQ_TYPE_GET_TELEMETRY_DATA: self._handle_get_telemetry_data,
         }
         
         # Create core handler
@@ -195,3 +200,35 @@ class ProtocolRequestHelper:
         logger.debug(f"GET_STATUS: noise={noise_floor}dBm, rssi={last_rssi}dBm, snr={last_snr/4}dB")
         
         return stats
+
+    def _handle_get_telemetry_data(self, client, timestamp: int, req_data: bytes):
+        percent = self._read_ups_battery_percent()
+        if percent is None:
+            logger.info("REQ_TYPE_GET_TELEMETRY_DATA no UPS battery data available")
+            return b""
+
+        percent = max(0, min(100, int(percent)))
+        return bytes((TELEM_CHANNEL_SELF, LPP_PERCENTAGE, percent))
+
+    def _read_ups_battery_percent(self):
+        try:
+            with open(UPS_BATCAP_CACHE, "r", encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except FileNotFoundError:
+            logger.debug("UPS battery cache missing at %s", UPS_BATCAP_CACHE)
+            return None
+        except OSError as exc:
+            logger.debug("UPS battery cache read failed: %s", exc)
+            return None
+
+        for line in lines:
+            if line.startswith("batcap="):
+                value = line.split("=", 1)[1].strip()
+                try:
+                    return int(float(value))
+                except ValueError:
+                    logger.debug("UPS battery cache parse failed: %s", line)
+                    return None
+
+        logger.debug("UPS battery cache missing batcap entry")
+        return None
