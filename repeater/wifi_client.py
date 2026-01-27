@@ -6,9 +6,10 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from pymc_core.node.handlers.ack import AckHandler
+from pymc_core.node.handlers.login_response import LoginResponseHandler
 from pymc_core.node.handlers.text import TextMessageHandler
 from pymc_core.node.events.events import MeshEvents
-from pymc_core.protocol import PacketBuilder, PacketTimingUtils
+from pymc_core.protocol import CryptoUtils, Identity, Packet, PacketBuilder, PacketTimingUtils
 from pymc_core.protocol.constants import (
     ADVERT_FLAG_HAS_LOCATION,
     ADVERT_FLAG_HAS_NAME,
@@ -17,8 +18,11 @@ from pymc_core.protocol.constants import (
     ADVERT_FLAG_IS_ROOM_SERVER,
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
+    PAYLOAD_TYPE_ANON_REQ,
     PAYLOAD_TYPE_PATH,
+    PAYLOAD_TYPE_RESPONSE,
     PAYLOAD_TYPE_TXT_MSG,
+    MAX_PATH_SIZE,
 )
 from pymc_core.protocol.utils import decode_appdata, parse_advert_payload
 from repeater.config import save_config
@@ -205,6 +209,12 @@ class CompanionContact:
     adv_lat: int = 0
     adv_lon: int = 0
     last_mod: int = 0
+    last_login_success: int = 0
+    is_admin: bool = False
+
+    @property
+    def type(self) -> int:
+        return self.contact_type
 
     @property
     def pubkey_prefix(self) -> bytes:
@@ -338,17 +348,24 @@ class WiFiCompanionServer:
 
         self._pending_acks: Dict[int, float] = {}
         self._event_service = WifiEventService(self)
+        self._login_waiters: Dict[int, set[int]] = {}
 
         self.text_handler = TextMessageHandler(
             local_identity=self.daemon.local_identity,
             contacts=self.contact_store,
             log_fn=logger.info,
             send_packet_fn=self._send_packet,
-            event_service=self._event_service,
+            event_service=None,
             radio_config=self._get_radio_config(),
         )
 
         self.ack_handler = AckHandler(logger.info, dispatcher=self.daemon.dispatcher)
+        self.login_response_handler = LoginResponseHandler(
+            local_identity=self.daemon.local_identity,
+            contacts=self.contact_store,
+            log_fn=logger.info,
+            login_callback=self._on_login_response,
+        )
 
     def _get_radio_config(self) -> dict:
         radio = getattr(self.daemon, "radio", None)
@@ -458,6 +475,12 @@ class WiFiCompanionServer:
             await self._handle_remove_contact(session, reader)
         elif cmd == CompanionProtocol.CommandCodes.SendTxtMsg:
             await self._handle_send_txt_msg(session, reader)
+        elif cmd == CompanionProtocol.CommandCodes.SendLogin:
+            await self._handle_send_login(session, reader)
+        elif cmd == CompanionProtocol.CommandCodes.SendStatusReq:
+            await self._handle_send_status_req(session, reader)
+        elif cmd == CompanionProtocol.CommandCodes.SendTelemetryReq:
+            await self._handle_send_telemetry_req(session, reader)
         elif cmd == CompanionProtocol.CommandCodes.SendChannelTxtMsg:
             await self._send_disabled(session)
         elif cmd == CompanionProtocol.CommandCodes.SyncNextMessage:
@@ -626,11 +649,11 @@ class WiFiCompanionServer:
             return
 
         message_type = "direct" if contact.out_path_len > 0 else "flood"
-        packet, ack_crc = PacketBuilder.create_text_message(
+        packet, ack_crc = self._create_text_packet(
             contact=contact,
-            local_identity=self.daemon.local_identity,
             message=message,
             attempt=attempt,
+            txt_type=txt_type,
             message_type=message_type,
             out_path=list(contact.out_path) if contact.out_path_len > 0 else None,
         )
@@ -652,6 +675,52 @@ class WiFiCompanionServer:
         payload.write_u32le(ack_crc)
         payload.write_u32le(int(timeout_ms))
         await session.send_frame(payload.to_bytes())
+
+    async def _handle_send_login(self, session: CompanionSession, reader: ByteReader):
+        public_key = reader.read_bytes(32)
+        password = reader.read_string().strip()
+        if len(public_key) != 32 or not password:
+            await self._send_err(session, CompanionProtocol.ErrorCodes.IllegalArg)
+            return
+
+        pubkey_hex = public_key.hex()
+        contact = self.contact_store.get(pubkey_hex)
+        if not contact:
+            contact = CompanionContact(
+                public_key=pubkey_hex,
+                name=f"{pubkey_hex[:8]}",
+                contact_type=CompanionProtocol.AdvType.Repeater,
+                last_mod=int(time.time()),
+            )
+            self.contact_store.upsert(contact)
+
+        dest_hash = public_key[0]
+        self.login_response_handler.store_login_password(dest_hash, password)
+        self._login_waiters.setdefault(dest_hash, set()).add(session.session_id)
+
+        packet = PacketBuilder.create_login_packet(
+            contact=contact,
+            local_identity=self.daemon.local_identity,
+            password=password,
+        )
+        await self._send_packet(packet, wait_for_ack=False)
+
+        packet_bytes = packet.write_to()
+        airtime_ms = PacketTimingUtils.estimate_airtime_ms(len(packet_bytes), self._get_radio_config())
+        timeout_ms = PacketTimingUtils.calc_direct_timeout_ms(airtime_ms, 0)
+
+        payload = ByteWriter()
+        payload.write_u8(CompanionProtocol.ResponseCodes.Sent)
+        payload.write_i8(0)
+        payload.write_u32le(0)
+        payload.write_u32le(int(timeout_ms))
+        await session.send_frame(payload.to_bytes())
+
+    async def _handle_send_status_req(self, session: CompanionSession, reader: ByteReader):
+        await self._send_err(session, CompanionProtocol.ErrorCodes.UnsupportedCmd)
+
+    async def _handle_send_telemetry_req(self, session: CompanionSession, reader: ByteReader):
+        await self._send_err(session, CompanionProtocol.ErrorCodes.UnsupportedCmd)
 
     async def _handle_send_self_advert(self, session: CompanionSession):
         if not self.daemon.send_advert:
@@ -737,6 +806,82 @@ class WiFiCompanionServer:
         except Exception as exc:
             logger.warning(f"Failed to persist WiFi companion config changes: {exc}")
 
+    def _create_text_packet(
+        self,
+        contact: CompanionContact,
+        message: str,
+        attempt: int,
+        txt_type: int,
+        message_type: str,
+        out_path: Optional[list] = None,
+    ) -> Tuple[Packet, int]:
+        attempt &= 0x03
+        txt_type &= 0x3F
+        timestamp = PacketBuilder._get_timestamp()
+        flags = (txt_type << 2) | attempt
+
+        plaintext = PacketBuilder._pack_timestamp_data(timestamp, flags, message, b"\x00")
+        payload, _, _ = PacketBuilder._create_encrypted_payload(
+            contact, self.daemon.local_identity, plaintext
+        )
+
+        crc_input = PacketBuilder._pack_timestamp_data(timestamp, attempt, message)
+        ack_crc = int.from_bytes(
+            CryptoUtils.sha256(crc_input + self.daemon.local_identity.get_public_key())[:4],
+            "little",
+        )
+
+        routing_path = (
+            out_path if out_path is not None else (contact.out_path if contact.out_path else [])
+        )
+        routing_path = PacketBuilder._validate_routing_path(routing_path)
+
+        pkt = Packet()
+        has_path = bool(routing_path and len(routing_path) > 0)
+        pkt.header = PacketBuilder._create_header(PAYLOAD_TYPE_TXT_MSG, message_type, has_path)
+
+        if routing_path and len(routing_path) > 0:
+            if len(routing_path) > MAX_PATH_SIZE:
+                routing_path = routing_path[:MAX_PATH_SIZE]
+            pkt.path = bytearray(routing_path)
+            pkt.path_len = len(pkt.path)
+        else:
+            pkt.path_len, pkt.path = 0, bytearray()
+
+        pkt.payload = bytearray(payload)
+        pkt.payload_len = len(payload)
+        return pkt, ack_crc
+
+    async def _on_login_response(self, success: bool, response_data: dict):
+        contact = response_data.get("contact")
+        if not contact:
+            return
+        dest_hash = bytes.fromhex(contact.public_key)[0]
+        sessions = self._login_waiters.pop(dest_hash, set())
+        if not sessions:
+            return
+        if success:
+            payload = ByteWriter()
+            payload.write_u8(CompanionProtocol.PushCodes.LoginSuccess)
+            payload.write_u8(0)
+            payload.write_bytes(bytes.fromhex(contact.public_key)[:6])
+            await self._broadcast_to_sessions(payload.to_bytes(), sessions)
+        else:
+            payload = ByteWriter()
+            payload.write_u8(CompanionProtocol.ResponseCodes.Err)
+            payload.write_u8(CompanionProtocol.ErrorCodes.BadState)
+            await self._broadcast_to_sessions(payload.to_bytes(), sessions)
+
+    async def _broadcast_to_sessions(self, frame_data: bytes, session_ids: set[int]):
+        for session_id in list(session_ids):
+            session = self.sessions.get(session_id)
+            if not session:
+                continue
+            try:
+                await session.send_frame(frame_data)
+            except Exception:
+                continue
+
     def handle_event(self, event_name: str, data: dict):
         if event_name != MeshEvents.NEW_MESSAGE:
             return
@@ -748,15 +893,15 @@ class WiFiCompanionServer:
         contact = self.contact_store.get(contact_pubkey)
         if not contact:
             return
-        self._send_contact_message_push(contact, data)
+        self._send_contact_message_push(contact, data, txt_type=0)
 
-    def _send_contact_message_push(self, contact: CompanionContact, data: dict):
+    def _send_contact_message_push(self, contact: CompanionContact, data: dict, txt_type: int):
         payload = ByteWriter()
         payload.write_u8(CompanionProtocol.ResponseCodes.ContactMsgRecv)
         payload.write_bytes(contact.pubkey_prefix)
         hops = data.get("network_info", {}).get("hops", 0)
         payload.write_u8(int(hops))
-        payload.write_u8(0)  # txt_type plain
+        payload.write_u8(int(txt_type))
         payload.write_u32le(int(data.get("timestamp", time.time())))
         payload.write_string(data.get("message_text", ""))
         asyncio.create_task(self._broadcast(payload.to_bytes()))
@@ -856,12 +1001,15 @@ class WiFiCompanionServer:
         payload_type = packet.get_payload_type()
         if payload_type == PAYLOAD_TYPE_TXT_MSG:
             await self.text_handler(packet)
+            await self._handle_text_push(packet)
         elif payload_type == PAYLOAD_TYPE_ACK:
             await self._handle_ack_packet(packet)
         elif payload_type == PAYLOAD_TYPE_PATH:
             await self._handle_path_packet(packet)
         elif payload_type == PAYLOAD_TYPE_ADVERT:
             await self._handle_advert_packet(packet)
+        elif payload_type in (PAYLOAD_TYPE_RESPONSE, PAYLOAD_TYPE_ANON_REQ):
+            await self.login_response_handler(packet)
 
     async def _handle_ack_packet(self, packet):
         ack_crc = await self.ack_handler.process_discrete_ack(packet)
@@ -889,6 +1037,47 @@ class WiFiCompanionServer:
                 await self._send_advert_push(contact)
         except Exception as exc:
             logger.debug(f"Failed to parse advert for WiFi companion: {exc}")
+
+    async def _handle_text_push(self, packet):
+        if len(packet.payload) < 4:
+            return
+        src_hash = packet.payload[1]
+        matched_contact = None
+        for contact in self.contact_store.contacts:
+            try:
+                if bytes.fromhex(contact.public_key)[0] == src_hash:
+                    matched_contact = contact
+                    break
+            except Exception:
+                continue
+        if not matched_contact:
+            return
+
+        try:
+            peer_id = Identity(bytes.fromhex(matched_contact.public_key))
+            shared_secret = peer_id.calc_shared_secret(self.daemon.local_identity.get_private_key())
+            aes_key = shared_secret[:16]
+            payload = packet.payload[2:]
+            decrypted = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, payload)
+            if len(decrypted) < 5:
+                return
+            timestamp = int.from_bytes(decrypted[:4], "little")
+            flags = decrypted[4]
+            txt_type = (flags >> 2) & 0x3F
+            message_body = decrypted[5:].rstrip(b"\x00")
+            message_text = message_body.decode("utf-8", errors="replace")
+            data = {
+                "message_text": message_text,
+                "timestamp": timestamp,
+                "network_info": {
+                    "rssi": getattr(packet, "rssi", 0),
+                    "snr": getattr(packet, "snr", 0.0),
+                    "hops": getattr(packet, "path_len", 0),
+                },
+            }
+            self._send_contact_message_push(matched_contact, data, txt_type=txt_type)
+        except Exception:
+            return
 
     def _notify_ack_received(self, ack_crc: int):
         sent_at = self._pending_acks.pop(ack_crc, None)
