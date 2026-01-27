@@ -954,3 +954,51 @@ class APIEndpoints:
         except Exception as e:
             logger.error(f"Error pinging neighbor: {e}")
             return self._error(e)
+
+    # ---------------- WiFi Companion API ----------------
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def wifi_client_status(self):
+        try:
+            companion = getattr(self.daemon_instance, "wifi_companion", None)
+            if not companion:
+                return self._error("WiFi companion not available")
+            return self._success(companion.get_status())
+        except Exception as e:
+            logger.error(f"Error getting WiFi companion status: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def wifi_client_contacts(self):
+        try:
+            companion = getattr(self.daemon_instance, "wifi_companion", None)
+            if not companion:
+                return self._error("WiFi companion not available")
+            contacts = companion.get_contacts_snapshot()
+            return self._success(contacts, count=len(contacts))
+        except Exception as e:
+            logger.error(f"Error getting WiFi companion contacts: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def wifi_client_disconnect(self):
+        try:
+            self._require_post()
+            companion = getattr(self.daemon_instance, "wifi_companion", None)
+            if not companion:
+                return self._error("WiFi companion not available")
+            data = cherrypy.request.json or {}
+            session_id = data.get("session_id")
+            if session_id is None:
+                return self._error("session_id is required")
+            success = companion.disconnect_session(int(session_id))
+            return self._success("Disconnected") if success else self._error("Session not found")
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error disconnecting WiFi companion session: {e}")
+            return self._error(e)

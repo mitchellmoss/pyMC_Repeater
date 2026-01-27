@@ -8,6 +8,7 @@ from repeater.engine import RepeaterHandler
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
 from repeater.handler_helpers import TraceHelper, DiscoveryHelper, AdvertHelper
 from repeater.packet_router import PacketRouter
+from repeater.wifi_client import WiFiCompanionServer
 
 logger = logging.getLogger("RepeaterDaemon")
 
@@ -27,6 +28,7 @@ class RepeaterDaemon:
         self.advert_helper = None
         self.discovery_helper = None
         self.router = None
+        self.wifi_companion = None
 
 
         log_level = config.get("logging", {}).get("level", "INFO")
@@ -144,6 +146,10 @@ class RepeaterDaemon:
                 logger.info("Discovery processing helper initialized")
             else:
                 logger.info("Discovery response handler disabled")
+
+            # Start WiFi companion server (MeshCore app client)
+            self.wifi_companion = WiFiCompanionServer(self, self.config)
+            await self.wifi_companion.start()
 
         except Exception as e:
             logger.error(f"Failed to initialize dispatcher: {e}")
@@ -269,6 +275,8 @@ class RepeaterDaemon:
                 await self.router.stop()
             if self.http_server:
                 self.http_server.stop()
+            if self.wifi_companion:
+                await self.wifi_companion.stop()
 
 
 def main():

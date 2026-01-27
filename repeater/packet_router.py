@@ -103,6 +103,13 @@ class PacketRouter:
         """
         payload_type = packet.get_payload_type()
         processed_by_injection = False
+
+        # Forward packet to WiFi companion service for MeshCore app integration
+        if self.daemon.wifi_companion:
+            try:
+                await self.daemon.wifi_companion.process_packet(packet)
+            except Exception as exc:
+                logger.debug(f\"WiFi companion packet processing error: {exc}\")
         
         # Route to specific handlers for parsing only
         if payload_type == TraceHandler.payload_type():

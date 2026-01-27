@@ -70,18 +70,26 @@ class StatsApp:
         # Create nested API object for routing
         self.api = APIEndpoints(stats_getter, send_advert_func, self.config, event_loop, daemon_instance, config_path)
 
+    def _read_html(self, filename: str) -> str:
+        html_path = os.path.join(self.html_dir, filename)
+        try:
+            with open(html_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except FileNotFoundError:
+            raise cherrypy.HTTPError(404, f"{filename} not found")
+        except Exception as e:
+            logger.error(f"Error serving {filename}: {e}")
+            raise cherrypy.HTTPError(500, "Internal server error")
+
     @cherrypy.expose
     def index(self):
         """Serve the Vue.js application index.html."""
-        index_path = os.path.join(self.html_dir, "index.html")
-        try:
-            with open(index_path, 'r', encoding='utf-8') as f:
-                return f.read()
-        except FileNotFoundError:
-            raise cherrypy.HTTPError(404, "Application not found. Please build the frontend first.")
-        except Exception as e:
-            logger.error(f"Error serving index.html: {e}")
-            raise cherrypy.HTTPError(500, "Internal server error")
+        return self._read_html("index.html")
+
+    @cherrypy.expose
+    def wifi_client(self):
+        """Serve the WiFi companion client dashboard."""
+        return self._read_html("wifi-client.html")
 
     @cherrypy.expose
     def default(self, *args, **kwargs):

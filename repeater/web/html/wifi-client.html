@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <link rel="icon" href="/favicon.ico">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>pyMC Repeater WiFi Client</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" crossorigin href="/assets/index-BsJox_xF.css">
+    <style>
+      body { font-family: 'Noto Sans', sans-serif; }
+    </style>
+  </head>
+  <body class="bg-dark-bg text-white">
+    <div class="min-h-screen px-6 py-8">
+      <div class="max-w-6xl mx-auto space-y-6">
+        <header class="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+          <div>
+            <h1 class="text-2xl font-semibold">MeshCore WiFi Client</h1>
+            <p class="text-dark-text text-sm">Companion service for the MeshCore app, backed by pyMC Repeater.</p>
+          </div>
+          <div class="flex items-center gap-3">
+            <button id="refresh-btn" class="px-4 py-2 bg-primary/20 text-primary border border-primary/40 rounded-lg text-sm hover:bg-primary/30 transition-colors">Refresh</button>
+            <a href="/" class="px-4 py-2 bg-white/10 text-white border border-white/20 rounded-lg text-sm hover:bg-white/20 transition-colors">Back to Dashboard</a>
+          </div>
+        </header>
+
+        <section class="grid gap-6 md:grid-cols-2">
+          <div class="bg-dark-card/30 backdrop-blur border border-white/10 rounded-[15px] p-6">
+            <h2 class="text-lg font-semibold mb-4">Service Status</h2>
+            <div id="status" class="space-y-2 text-sm text-white/80"></div>
+          </div>
+          <div class="bg-dark-card/30 backdrop-blur border border-white/10 rounded-[15px] p-6">
+            <h2 class="text-lg font-semibold mb-4">Active Sessions</h2>
+            <div id="sessions" class="space-y-3 text-sm text-white/80"></div>
+          </div>
+        </section>
+
+        <section class="bg-dark-card/30 backdrop-blur border border-white/10 rounded-[15px] p-6">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-lg font-semibold">Known Contacts</h2>
+            <span id="contacts-count" class="text-xs text-white/60"></span>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="text-left text-dark-text">
+                  <th class="pb-2">Name</th>
+                  <th class="pb-2">Public Key</th>
+                  <th class="pb-2">Type</th>
+                  <th class="pb-2">Last Seen</th>
+                </tr>
+              </thead>
+              <tbody id="contacts"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <script>
+      const statusEl = document.getElementById('status');
+      const sessionsEl = document.getElementById('sessions');
+      const contactsEl = document.getElementById('contacts');
+      const contactsCountEl = document.getElementById('contacts-count');
+
+      function formatTimestamp(ts) {
+        if (!ts) return '—';
+        return new Date(ts * 1000).toLocaleString();
+      }
+
+      function renderStatus(data) {
+        statusEl.innerHTML = '';
+        const items = [
+          ['Enabled', data.enabled ? 'Yes' : 'No'],
+          ['Host', data.host || '—'],
+          ['Port', data.port || '—'],
+          ['Manual Add Contacts', data.manual_add_contacts ? 'Yes' : 'No'],
+          ['Include Neighbors', data.include_neighbors ? 'Yes' : 'No'],
+          ['Active Sessions', data.session_count ?? 0],
+          ['Known Contacts', data.contacts ?? 0]
+        ];
+        items.forEach(([label, value]) => {
+          const row = document.createElement('div');
+          row.className = 'flex items-center justify-between border-b border-white/5 pb-2';
+          row.innerHTML = `<span>${label}</span><span class="text-white">${value}</span>`;
+          statusEl.appendChild(row);
+        });
+      }
+
+      function renderSessions(sessions) {
+        sessionsEl.innerHTML = '';
+        if (!sessions.length) {
+          sessionsEl.innerHTML = '<p class="text-white/50">No active sessions.</p>';
+          return;
+        }
+        sessions.forEach(session => {
+          const card = document.createElement('div');
+          card.className = 'bg-white/5 border border-white/10 rounded-lg p-3';
+          card.innerHTML = `
+            <div class="flex items-center justify-between">
+              <span class="text-white">Session #${session.id}</span>
+              <span class="text-xs text-white/60">${formatTimestamp(session.connected_at)}</span>
+            </div>
+            <div class="text-xs text-white/60 mt-1">${session.remote}</div>
+          `;
+          sessionsEl.appendChild(card);
+        });
+      }
+
+      function renderContacts(contacts) {
+        contactsEl.innerHTML = '';
+        contactsCountEl.textContent = `${contacts.length} total`;
+        if (!contacts.length) {
+          const row = document.createElement('tr');
+          row.innerHTML = '<td class="py-3 text-white/50" colspan="4">No contacts available.</td>';
+          contactsEl.appendChild(row);
+          return;
+        }
+        contacts.forEach(contact => {
+          const row = document.createElement('tr');
+          row.className = 'border-t border-white/5';
+          row.innerHTML = `
+            <td class="py-3 text-white">${contact.name || 'Unknown'}</td>
+            <td class="py-3 font-mono text-xs text-white/80">${contact.public_key}</td>
+            <td class="py-3 text-white/80">${contact.type}</td>
+            <td class="py-3 text-white/60">${formatTimestamp(contact.last_mod)}</td>
+          `;
+          contactsEl.appendChild(row);
+        });
+      }
+
+      async function loadData() {
+        try {
+          const statusResp = await fetch('/api/wifi_client_status');
+          const statusJson = await statusResp.json();
+          if (statusJson.success) {
+            renderStatus(statusJson.data);
+            renderSessions(statusJson.data.sessions || []);
+          }
+        } catch (err) {
+          statusEl.innerHTML = '<p class="text-red-400">Failed to load status.</p>';
+        }
+
+        try {
+          const contactsResp = await fetch('/api/wifi_client_contacts');
+          const contactsJson = await contactsResp.json();
+          if (contactsJson.success) {
+            renderContacts(contactsJson.data || []);
+          }
+        } catch (err) {
+          renderContacts([]);
+        }
+      }
+
+      document.getElementById('refresh-btn').addEventListener('click', loadData);
+      loadData();
+      setInterval(loadData, 10000);
+    </script>
+  </body>
+</html>

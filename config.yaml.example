@@ -193,3 +193,22 @@ web:
   # If not specified, uses the default built-in path
   # Example: /opt/custom-web-ui or /home/user/my-frontend
   # web_path: null
+
+# WiFi MeshCore companion client
+wifi_client:
+  # Enable TCP companion server for MeshCore app / meshcore-cli
+  enabled: true
+
+  # Bind address and TCP port (meshcore-cli defaults to port 5000)
+  host: "0.0.0.0"
+  port: 5000
+
+  # When true, MeshCore app must manually add contacts (NewAdvert push)
+  # When false, contacts are auto-added from adverts (Advert push)
+  manual_add_contacts: false
+
+  # Include discovered neighbors in contact list
+  include_neighbors: true
+
+  # Limit concurrent TCP sessions
+  max_sessions: 5
