@@ -109,7 +109,7 @@ class PacketRouter:
             try:
                 await self.daemon.wifi_companion.process_packet(packet)
             except Exception as exc:
-                logger.debug(f\"WiFi companion packet processing error: {exc}\")
+                logger.debug(f"WiFi companion packet processing error: {exc}")
         
         # Route to specific handlers for parsing only
         if payload_type == TraceHandler.payload_type():
